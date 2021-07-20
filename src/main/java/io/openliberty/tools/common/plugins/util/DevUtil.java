@@ -245,6 +245,15 @@ public abstract class DevUtil extends AbstractContainerSupportUtil {
     public abstract boolean compile(File dir);
 
     /**
+     * Compile the specified directory for the project module
+     * 
+     * @param dir
+     * @param project project module (used in multi-module scenario)
+     * @return
+     */
+    public abstract boolean compile(File dir, ProjectModule project);
+
+    /**
      * Stop the server
      */
     public abstract void stopServer();
@@ -2485,6 +2494,7 @@ public abstract class DevUtil extends AbstractContainerSupportUtil {
                         // watch src/main/java dir
                         if (p.getSourceDirectory().exists()) {
                             registerAll(p.getSourceDirectory().getCanonicalFile().toPath(), executor);
+                            p.sourceDirRegistered = true;
                         }
                     }
 
@@ -2612,6 +2622,9 @@ public abstract class DevUtil extends AbstractContainerSupportUtil {
                         compile(this.sourceDirectory);
                         registerAll(srcPath, executor);
                         debug("Registering Java source directory: " + this.sourceDirectory);
+                        // run tests after waiting for app update since app changed
+                        int numApplicationUpdatedMessages = countApplicationUpdatedMessages();
+                        runTestThread(true, executor, numApplicationUpdatedMessages, skipUTs, false, buildFile);
                         sourceDirRegistered = true;
                     } else if (sourceDirRegistered && !this.sourceDirectory.exists()) {
                         cleanTargetDir(outputDirectory);
@@ -2697,15 +2710,40 @@ public abstract class DevUtil extends AbstractContainerSupportUtil {
                             }
                         }
 
+                        // Adding a src/main/java dir to an upstream project is not currently supported
+                        // for multi module projects. See
+                        // https://github.com/OpenLiberty/ci.maven/issues/1202
+                        if (shouldIncludeSources(p.getPackagingType())) {
+                            if (!p.sourceDirRegistered && p.getSourceDirectory().exists()
+                                    && p.getSourceDirectory().listFiles().length > 0) {
+                                p.sourceDirRegistered = true;
+                                warn("The source directory " + p.getSourceDirectory()
+                                        + " was added.  This may result in compilation errors between dependent modules.  Restart dev mode for it to take effect.");
+                            } else if (p.sourceDirRegistered && !p.getSourceDirectory().exists()) {
+                                p.sourceDirRegistered = false;
+                                warn("The source directory " + p.getSourceDirectory()
+                                        + " was deleted.  This may result in compilation errors between dependent modules.  Restart dev mode for it to take effect.");
+                            }
+                        }
+
                         // check if test directory of an upstream project has been added/deleted
                         if (!p.testSourceDirRegistered && p.getTestSourceDirectory().exists()
                                 && p.getTestSourceDirectory().listFiles().length > 0) {
-                            compile(p.getTestSourceDirectory());
+                            compile(p.getTestSourceDirectory(), p);
                             registerAll(p.getTestSourceDirectory().getCanonicalFile().toPath(), executor);
-                            debug("Registering Java test directory: " + p.getTestSourceDirectory());
-                            runTestThread(false, executor, -1, p.skipUTs(), false, getAllBuildFiles(p));
                             p.testSourceDirRegistered = true;
-
+                            debug("Registering Java test directory: " + p.getTestSourceDirectory());
+                            // compile all tests in downstream modules
+                            for (File dependentBuildFile : p.getDependentModules()) {
+                                ProjectModule depModule = getProjectModule(dependentBuildFile);
+                                if (depModule != null) {
+                                    compile(depModule.getTestSourceDirectory(), depModule);
+                                } else {
+                                    // main module
+                                    compile(this.testSourceDirectory);
+                                }
+                            }
+                            runTestThread(false, executor, -1, p.skipUTs(), false, getAllBuildFiles(p));
                         } else if (p.testSourceDirRegistered && !p.getTestSourceDirectory().exists()) {
                             cleanTargetDir(p.getTestOutputDirectory());
                             p.testSourceDirRegistered = false;
@@ -3360,7 +3398,9 @@ public abstract class DevUtil extends AbstractContainerSupportUtil {
         if (fileChanged.isDirectory()) {
             // if new directory added, watch the entire directory
             if (changeType == ChangeType.CREATE) {
-                registerAll(fileChanged.toPath(), executor);
+                if (!isUpstreamSourceDir(fileChanged)) { // adding a src/main/java dir to an upstream project is not currently supported
+                    registerAll(fileChanged.toPath(), executor);
+                }
             }
             // otherwise if a directory was modified, just continue to the next entry
             // (if delete, can't tell if it was a directory since it doesn't exist anymore)
@@ -4649,4 +4689,19 @@ public abstract class DevUtil extends AbstractContainerSupportUtil {
         return (!project.disableDependencyCompile && recompileDependencies && !initialCompile);
     }
 
+    // returns true if directory is a src/main/java dir of an upstream module
+    private boolean isUpstreamSourceDir(File dirAdded) {
+        try {
+            if (isMultiModuleProject()) {
+                for (ProjectModule p : upstreamProjects) {
+                    if (p.getSourceDirectory().getCanonicalPath().startsWith(dirAdded.getCanonicalPath())) {
+                        return true;
+                    }
+                }
+            }
+            return false;
+        } catch (IOException e) {
+            return false;
+        }
+    }
 }
